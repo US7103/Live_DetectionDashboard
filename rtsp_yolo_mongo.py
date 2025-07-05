@@ -12,7 +12,6 @@ import logging
 import signal
 import sys
 
-
 # Configuration
 CONFIG = {
     "mongo_uri": "mongodb://localhost:27017/",
@@ -21,13 +20,14 @@ CONFIG = {
     "rtsp_url": "rtsp://admin:admin@123@192.168.100.11:554/0",
     "yolo_model": "yolov5s",
     "ollama_url": "http://192.168.100.67:11434/api/generate",
-    "ollama_model": "llama3.2-vision:latest",  # Use text model for better JSON processing
-    "frame_skip": 5,  # Process every 5th frame
-    "request_timeout": 10,  # Seconds
+    "ollama_model": "llama3.2-vision:latest",
+    "frame_skip": 5,
+    "request_timeout": 10,
     "max_retries": 3,
-    "poll_interval": 1,  # Seconds to check for new documents
+    "poll_interval": 1,
+    "confidence_threshold": 0.3,  # Updated to 70%
+    "max_reconnect_attempts": 5
 }
-
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -39,7 +39,6 @@ try:
     client.server_info()
     db = client[CONFIG["mongo_db"]]
     collection = db[CONFIG["mongo_collection"]]
-    # Create index on timestamp for efficient queries
     collection.create_index([("timestamp", -1)])
 except Exception as e:
     logger.error(f"Failed to connect to MongoDB: {e}")
@@ -55,7 +54,7 @@ def clean_mongo_data(data):
         return str(data)
     return data
 
-# Load YOLOvpillar model
+# Load YOLOv5 model
 try:
     model = torch.hub.load('ultralytics/yolov5', CONFIG["yolo_model"], pretrained=True)
 except Exception as e:
@@ -63,41 +62,67 @@ except Exception as e:
     sys.exit(1)
 
 # Initialize video capture
-cap = cv2.VideoCapture(CONFIG["rtsp_url"])
-if not cap.isOpened():
-    logger.error(f"Failed to open RTSP stream: {CONFIG['rtsp_url']}")
+def init_video_capture():
+    cap = cv2.VideoCapture(CONFIG["rtsp_url"])
+    if not cap.isOpened():
+        logger.error(f"Failed to open RTSP stream: {CONFIG['rtsp_url']}")
+        return None
+    return cap
+
+cap = init_video_capture()
+if cap is None:
     sys.exit(1)
 
 # Process RTSP stream and save detections to MongoDB
 def process_rtsp_stream():
+    global cap
     frame_count = 0
+    reconnect_attempts = 0
+
     while True:
+        if cap is None or not cap.isOpened():
+            if reconnect_attempts >= CONFIG["max_reconnect_attempts"]:
+                logger.error("Max reconnection attempts reached. Exiting.")
+                sys.exit(1)
+            logger.warning("RTSP stream not available. Attempting to reconnect...")
+            if cap is not None:
+                cap.release()
+            time.sleep(1)
+            cap = init_video_capture()
+            reconnect_attempts += 1
+            if cap is None:
+                logger.error("Failed to reconnect to RTSP stream.")
+                continue
+            logger.info("Successfully reconnected to RTSP stream.")
+            reconnect_attempts = 0
+
         ret, frame = cap.read()
         if not ret:
             logger.warning("Failed to read frame from RTSP stream. Retrying...")
-            cap.release()
-            time.sleep(1)
-            cap = cv2.VideoCapture(CONFIG["rtsp_url"])
             continue
 
         frame_count += 1
         if frame_count % CONFIG["frame_skip"] != 0:
             continue
 
-        # Resize frame for faster processing
         frame = cv2.resize(frame, (640, 480))
         results = model(frame)
         detections = results.pandas().xyxy[0].to_dict('records')
 
-        # Prepare batch of detections
         batch = []
         for det in detections:
             if 'name' not in det or 'confidence' not in det:
                 continue
+            confidence = float(det['confidence'])
+            logger.debug(f"Detected {det['name']} with confidence {confidence}")
+
+            if confidence < CONFIG["confidence_threshold"]:
+                continue
+
             detection_data = {
                 "timestamp": datetime.utcnow().isoformat(),
                 "label": det['name'],
-                "confidence": round(float(det['confidence']), 4),
+                "confidence": float(round(confidence, 2)),  # Store as float, rounded to 2 decimals
                 "bbox": {
                     "xmin": round(float(det['xmin']), 2),
                     "ymin": round(float(det['ymin']), 2),
@@ -115,7 +140,7 @@ def process_rtsp_stream():
             except Exception as e:
                 logger.error(f"Failed to insert detections: {e}")
 
-        time.sleep(0.1)  # Prevent CPU overload
+        time.sleep(0.1)
 
 # Format and send detection to Ollama
 def format_detection(new_doc):
@@ -123,7 +148,13 @@ def format_detection(new_doc):
     if not all(field in new_doc for field in required_fields):
         logger.warning(f"Skipping invalid document: {new_doc}")
         return
+    
+    confidence_percent = round(float(new_doc['confidence']) * 100, 2)
+    if confidence_percent < CONFIG["confidence_threshold"] * 100:
+        logger.debug(f"Skipping display of detection with confidence {confidence_percent}%")
+        return
 
+    logger.debug(f"Formatting detection with confidence: {confidence_percent}%")
     prompt = f"""
 You are an assistant that formats YOLOv5 detection logs into a clean structured report.
 
@@ -131,13 +162,11 @@ Here is the raw detection data in JSON:
 {json.dumps(new_doc, indent=2)}
 
 Please format it into a readable bullet-style report including:
-- Timestamp
-- Object Detected (from 'label')
-- Confidence (as a percentage, rounded to 2 decimal places)
-- Bounding Box with top-left (xmin, ymin) and bottom-right (xmax, ymax) coordinates (rounded to 2 decimal places)
-- Source camera name (from 'source')
-
-Do NOT summarize or skip any field. Just reformat it clearly and completely.
+- Timestamp: {new_doc['timestamp']}
+- Object Detected: {new_doc['label']}
+- Confidence: {confidence_percent}%
+- Bounding Box: Top-left (xmin: {new_doc['bbox']['xmin']}, ymin: {new_doc['bbox']['ymin']}), Bottom-right (xmax: {new_doc['bbox']['xmax']}, ymax: {new_doc['bbox']['ymax']})
+- Source: {new_doc['source']}
 """
     for attempt in range(CONFIG["max_retries"]):
         try:
@@ -170,20 +199,25 @@ def poll_mongodb():
             query = {} if last_timestamp is None else {"timestamp": {"$gt": last_timestamp}}
             new_docs = list(collection.find(query).sort("timestamp", -1).limit(10))
             if new_docs:
-                last_timestamp = new_docs[0]["timestamp"]  # Update to the latest timestamp
-                for doc in reversed(new_docs):  # Process in ascending order
-                    format_detection(clean_mongo_data(doc))
+                last_timestamp = new_docs[0]["timestamp"]
+                for doc in reversed(new_docs):
+                    if float(doc['confidence']) >= CONFIG["confidence_threshold"]:
+                        format_detection(clean_mongo_data(doc))
+                    else:
+                        logger.debug(f"Skipping document with confidence {float(doc['confidence'])*100}%")
             else:
                 logger.debug("No new detections found")
         except Exception as e:
             logger.error(f"Error polling MongoDB: {e}")
-            time.sleep(5)  # Wait before retrying
+            time.sleep(5)
         time.sleep(CONFIG["poll_interval"])
 
 # Signal handler for graceful shutdown
 def signal_handler(sig, frame):
     logger.info("Stopping RTSP stream and MongoDB polling...")
-    cap.release()
+    global cap
+    if cap is not None:
+        cap.release()
     client.close()
     sys.exit(0)
 
@@ -191,7 +225,7 @@ def signal_handler(sig, frame):
 def main():
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
-    
+
     rtsp_thread = threading.Thread(target=process_rtsp_stream, daemon=True)
     rtsp_thread.start()
     poll_mongodb()

@@ -23,7 +23,6 @@
 # cap.release()
 # cv2.destroyAllWindows()
 
-
 import subprocess
 import cv2
 import numpy as np
@@ -74,24 +73,22 @@ while True:
     results = model(frame)
     detections = results.pandas().xyxy[0]
 
-    # Log each detection to MongoDB
+    # Log each detection to MongoDB only if confidence > 0.3
     for _, row in detections.iterrows():
-        
-            
-        detection_record = {
-            
-            "timestamp": datetime.utcnow().isoformat(),
-            "label": row['name'],
-            "confidence": int(row['confidence']),
-            "bbox": {
-                "xmin": float(row['xmin']),
-                "ymin": float(row['ymin']),
-                "xmax": float(row['xmax']),
-                "ymax": float(row['ymax']),
-            },
-            "source": "IP_CAM_192.168.100.11"
-        }
-        collection.insert_one(detection_record)
+        if row['confidence'] > 0.3:
+            detection_record = {
+                "timestamp": datetime.utcnow().isoformat(),
+                "label": row['name'],
+                "confidence": float(row['confidence']),
+                "bbox": {
+                    "xmin": float(row['xmin']),
+                    "ymin": float(row['ymin']),
+                    "xmax": float(row['xmax']),
+                    "ymax": float(row['ymax']),
+                },
+                "source": "IP_CAM_192.168.100.11"
+            }
+            collection.insert_one(detection_record)
 
     # Display frame
     annotated = results.render()[0]
